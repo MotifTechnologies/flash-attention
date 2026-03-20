@@ -343,6 +343,8 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
+        row_max: Optional[cute.Tensor] = None,
     ):
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
@@ -392,6 +394,31 @@ class FlashAttentionForwardBase:
                             taccOgLSE[m, 0] = lse[m]
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+
+        # Write per-row max attention logit (same layout as LSE)
+        if const_expr(mMaxAttnLogit is not None):
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mMAL_cur = mMaxAttnLogit[None, head_idx, batch_idx]
+            else:
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mMAL_cur = cute.domain_offset((offset,), mMaxAttnLogit[None, head_idx])
+            if const_expr(not self.pack_gqa):
+                gMAL = cute.local_tile(mMAL_cur, (self.tile_m,), (m_block,))
+                gMAL_expanded_layout = cute.append(
+                    gMAL.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
+                )
+                gMAL_expanded = cute.make_tensor(gMAL.iterator, gMAL_expanded_layout)
+                thr_mma = tiled_mma.get_slice(tidx)
+                taccOgMAL = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gMAL_expanded))
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                if taccOcO[0][1] == 0:
+                    for m in cutlass.range_constexpr(cute.size(taccOgMAL.shape[1])):
+                        if (
+                            t0accOcO[m, 0][0]
+                            < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
+                        ):
+                            taccOgMAL[m, 0] = row_max[m]
 
         if const_expr(not seqlen.has_cu_seqlens_q):
             mO_cur = mO[None, None, head_idx, batch_idx]
@@ -640,6 +667,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         aux_tensors=None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -665,6 +693,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             for t in (mQ, mK, mV, mO)
         ]
         mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
+        if const_expr(mMaxAttnLogit is not None):
+            mMaxAttnLogit = cute.make_tensor(mMaxAttnLogit.iterator, cute.select(mMaxAttnLogit.layout, mode=[2, 1, 0]))
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mQ.shape[0], self.tile_m),
@@ -716,6 +746,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            mMaxAttnLogit,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -749,6 +780,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         aux_tensors=None,
         fastdiv_mods=None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1010,6 +1042,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         row_scale = softmax.finalize()
         softmax.rescale_O(acc_O, row_scale)
 
+        # Compute per-row max attention logit (same shape as LSE)
+        # row_max is raw Q@K^T max; actual logit = row_max * softmax_scale
+        # softmax_scale_log2 = softmax_scale * log2(e), so row_max * scale_log2 * LN2 = row_max * softmax_scale
+        if const_expr(mMaxAttnLogit is not None):
+            LN2 = math.log(2.0)
+            for r in cutlass.range(cute.size(softmax.row_max), unroll_full=True):
+                softmax.row_max[r] = softmax.row_max[r] * softmax_scale_log2 * LN2
+
         # ///////////////////////////////////////////////////////////////////////////////
         # Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1029,6 +1069,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
+            mMaxAttnLogit=mMaxAttnLogit,
+            row_max=softmax.row_max if const_expr(mMaxAttnLogit is not None) else None,
         )
 
     @cute.jit
@@ -1263,6 +1305,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -1284,6 +1327,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE = layout_utils.select(mLSE, LSE_layout_transpose) if const_expr(mLSE is not None) else None
+        mMaxAttnLogit = layout_utils.select(mMaxAttnLogit, LSE_layout_transpose) if const_expr(mMaxAttnLogit is not None) else None
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
@@ -1520,6 +1564,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            mMaxAttnLogit,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -1565,6 +1610,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -2151,6 +2197,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
+            # Scale row_max to actual attention logit
+            if const_expr(mMaxAttnLogit is not None):
+                LN2 = math.log(2.0)
+                for r in cutlass.range(cute.size(softmax.row_max), unroll_full=True):
+                    softmax.row_max[r] = softmax.row_max[r] * softmax_scale_log2 * LN2
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
@@ -2168,6 +2220,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                mMaxAttnLogit=mMaxAttnLogit,
+                row_max=softmax.row_max if const_expr(mMaxAttnLogit is not None) else None,
             )
 
             tile_scheduler.advance_to_next_work()

@@ -126,6 +126,7 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    return_max_attn_logit: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
@@ -246,11 +247,21 @@ def _flash_attn_fwd(
     if lse is None:
         lse = (
             torch.empty(lse_shape, dtype=torch.float32, device=device)
-            if requires_grad or return_lse
+            if requires_grad or return_lse or return_max_attn_logit
             else None
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+
+    if return_max_attn_logit:
+        assert score_mod is None, "return_max_attn_logit is not supported with score_mod"
+        assert softcap is None or softcap == 0.0, "return_max_attn_logit is not supported with softcap"
+        assert num_splits <= 1, "return_max_attn_logit is not supported with split-K (num_splits > 1)"
+        pack_gqa = False
+        # Per-row max logit, same shape as LSE. Reduce on host for per-head max.
+        max_attn_logit = torch.full(lse_shape, float('-inf'), dtype=torch.float32, device=device)
+    else:
+        max_attn_logit = None
 
     dtype = torch2cute_dtype_map[q.dtype]
     arch = _get_device_arch() if _arch is None else _arch
@@ -298,6 +309,12 @@ def _flash_attn_fwd(
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
+        # TMEM limit (512 cols): S uses 2*n_block_size, O uses q_stage*head_dim_v_padded.
+        # When head_dim_v is large (e.g. 256 for GDA V1 fused kernel), q_stage=2 exceeds TMEM.
+        head_dim_v_padded_check = int(math.ceil(head_dim_v / 16) * 16)
+        tmem_total = 2 * n_block_size + q_stage * head_dim_v_padded_check
+        if tmem_total > 512:
+            q_stage = 1
     else:
         q_stage = 1
 
@@ -407,6 +424,7 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        return_max_attn_logit,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -435,6 +453,10 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+
+        max_attn_logit_tensor = (
+            to_cute_tensor(max_attn_logit, assumed_align=4) if max_attn_logit is not None else None
+        )
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -472,7 +494,7 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-            head_dim_v_padded = int(math.ceil(head_dim / 16) * 16)
+            head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
             use_2cta_instrs = (
                 not causal
                 and not local
@@ -532,6 +554,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            max_attn_logit_tensor,
             options="--enable-tvm-ffi",
         )
 
@@ -558,6 +581,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
+            max_attn_logit,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -568,7 +592,15 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    return out, lse
+    # Reduce per-row max logit to per-head max
+    if max_attn_logit is not None:
+        if cu_seqlens_q is None:
+            # shape (batch_size, num_head, seqlen_q) → (num_head,)
+            max_attn_logit = max_attn_logit.amax(dim=(0, 2))
+        else:
+            # shape (num_head, total_q) → (num_head,)
+            max_attn_logit = max_attn_logit.amax(dim=1)
+    return out, lse, max_attn_logit
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1342,6 +1374,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
+        return_max_attn_logit: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1353,7 +1386,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 mask_block_idx=mask_block_idx,
                 block_size=block_size,
             )
-        out, lse = _flash_attn_fwd(
+        out, lse, max_attn_logit = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1368,6 +1401,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
+            return_max_attn_logit=return_max_attn_logit,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1375,10 +1409,13 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.return_max_attn_logit = return_max_attn_logit
         # LSE gradient is not supported yet
         if lse is not None:
             ctx.mark_non_differentiable(lse)
-        return out, lse
+        if max_attn_logit is not None:
+            ctx.mark_non_differentiable(max_attn_logit)
+        return out, lse, max_attn_logit
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -1425,8 +1462,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        return_max_attn_logit: bool = False,
     ):
-        out, lse = _flash_attn_fwd(
+        out, lse, max_attn_logit = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1448,6 +1486,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            return_max_attn_logit=return_max_attn_logit,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1457,10 +1496,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.return_max_attn_logit = return_max_attn_logit
         # LSE gradient is not supported yet
         if lse is not None:
             ctx.mark_non_differentiable(lse)
-        return out, lse
+        if max_attn_logit is not None:
+            ctx.mark_non_differentiable(max_attn_logit)
+        return out, lse, max_attn_logit
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -1509,8 +1551,9 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
+    return_max_attn_logit: bool = False,
 ):
-    return FlashAttnFunc.apply(
+    out, lse, max_attn_logit = FlashAttnFunc.apply(
         q,
         k,
         v,
@@ -1529,7 +1572,11 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
+        return_max_attn_logit,
     )
+    if return_max_attn_logit:
+        return out, lse, max_attn_logit
+    return out, lse
 
 
 def flash_attn_varlen_func(
@@ -1554,8 +1601,9 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    return_max_attn_logit: bool = False,
 ):
-    return FlashAttnVarlenFunc.apply(
+    out, lse, max_attn_logit = FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
@@ -1577,7 +1625,11 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        return_max_attn_logit,
     )
+    if return_max_attn_logit:
+        return out, lse, max_attn_logit
+    return out, lse
 
 
 def _flash_attn_fwd_combine(

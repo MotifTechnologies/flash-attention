@@ -315,6 +315,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -355,6 +356,11 @@ class FlashAttentionForwardSm100:
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if const_expr(mLSE is not None)
+            else None
+        )
+        mMaxAttnLogit = (
+            cute.make_tensor(mMaxAttnLogit.iterator, cute.select(mMaxAttnLogit.layout, mode=LSE_layout_transpose))
+            if const_expr(mMaxAttnLogit is not None)
             else None
         )
         # (s, d, h, b) -> (d, s, h, b)
@@ -730,6 +736,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mMaxAttnLogit,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -775,6 +782,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1188,6 +1196,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mMaxAttnLogit,
             )
 
         return
@@ -2184,6 +2193,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2306,7 +2316,7 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or mMaxAttnLogit is not None):
                         row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     else:
                         row_max = None
@@ -2428,6 +2438,35 @@ class FlashAttentionForwardSm100:
                     if tidx < seqlen_q - m_tile_idx * self.m_block_size:
                         # This actually just works with PackGQA too
                         gLSE[tidx] = lse
+
+            # Write per-row max attention logit (same layout as LSE)
+            if const_expr(mMaxAttnLogit is not None):
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    if const_expr(self.is_split_kv):
+                        mMAL_cur = mMaxAttnLogit[None, head_idx, batch_idx, split_idx]
+                    else:
+                        mMAL_cur = mMaxAttnLogit[None, head_idx, batch_idx]
+                else:
+                    offset = (
+                        seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    )
+                    if const_expr(self.is_split_kv):
+                        mMAL_cur = cute.domain_offset((offset,), mMaxAttnLogit[None, head_idx, split_idx])
+                    else:
+                        mMAL_cur = cute.domain_offset((offset,), mMaxAttnLogit[None, head_idx])
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                    gMAL = cute.local_tile(mMAL_cur, (self.m_block_size,), (m_tile_idx,))
+                    row_sum_s, row_max_s, _ = stats[stage]
+                    LN2 = math.log(2.0)
+                    row_logit = row_max_s * softmax_scale_log2 * LN2
+                    seqlen_q = (
+                        seqlen.seqlen_q
+                        if const_expr(not self.pack_gqa)
+                        else seqlen.seqlen_q * self.qhead_per_kvhead
+                    )
+                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                        gMAL[tidx] = row_logit
 
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
