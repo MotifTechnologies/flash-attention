@@ -343,6 +343,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_max_attn_logit=False,
 ):
     if causal:
         window_size = (window_size[0], 0)
@@ -431,6 +432,11 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_max_attn_logit:
+        # scores shape: (batch, num_head, seqlen_q, seqlen_k)
+        # max over batch, query, and key positions → (num_head,)
+        max_attn_logit = scores.amax(dim=(0, 2, 3)).float()
+        return output.to(dtype=dtype_og), attention.to(dtype=dtype_og), max_attn_logit
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
