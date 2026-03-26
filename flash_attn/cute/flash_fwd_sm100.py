@@ -315,6 +315,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -355,6 +356,11 @@ class FlashAttentionForwardSm100:
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if const_expr(mLSE is not None)
+            else None
+        )
+        mMaxAttnLogit = (
+            cute.make_tensor(mMaxAttnLogit.iterator, cute.select(mMaxAttnLogit.layout, mode=LSE_layout_transpose))
+            if const_expr(mMaxAttnLogit is not None)
             else None
         )
         # (s, d, h, b) -> (d, s, h, b)
@@ -730,6 +736,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mMaxAttnLogit,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -775,6 +782,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1145,6 +1153,7 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
+                mMaxAttnLogit=mMaxAttnLogit,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1188,6 +1197,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mMaxAttnLogit,
             )
 
         return
@@ -1709,6 +1719,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1826,9 +1837,35 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
+            # Online softmax performance optimization: rescale_threshold skips
+            # the expensive O-rescaling step (TMEM load → multiply → store) when
+            # the row_max change between n_blocks is small. When skipped, row_max
+            # stays at its old value and acc_scale is set to 1.0.
+            #
+            # This is mathematically safe for both attention output and LSE:
+            # softmax is shift-invariant, so as long as all n_blocks use the same
+            # row_max (which they do when skip keeps it unchanged), the final
+            # O/row_sum ratio is exact. The threshold (8.0 in log2 space = exp2(8)
+            # = 256) ensures intermediate exp2 values stay within bf16 range.
+            #
+            # However, max_attn_logit needs the TRUE per-row maximum, so we must
+            # disable this optimization (threshold=0.0) when max_attn_logit is
+            # requested. This causes ~6-8% overhead due to O rescaling every
+            # n_block.
+            #
+            # TODO: A better approach would be to track true_row_max in a separate
+            # register (just a running max, no O rescaling needed) while keeping
+            # the threshold optimization for O. This would give correct
+            # max_attn_logit with ~0% overhead instead of 6-8%. Requires adding
+            # a true_row_max field to SoftmaxSm100 and an extra sScale slot.
+            _rescale_threshold = (
+                0.0 if const_expr(mMaxAttnLogit is not None)
+                else 8.0 if const_expr(self.q_dtype.width == 16)
+                else 0.0
+            )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=_rescale_threshold,
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -2184,6 +2221,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mMaxAttnLogit: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2306,7 +2344,7 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or mMaxAttnLogit is not None):
                         row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     else:
                         row_max = None
@@ -2394,6 +2432,25 @@ class FlashAttentionForwardSm100:
                         gmem_tiled_copy_O_for_empty_tile,
                     )
 
+            # Setup max_attn_logit pointer before the LSE/MAL write loop
+            if const_expr(mMaxAttnLogit is not None):
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    if const_expr(self.is_split_kv):
+                        mMAL_cur = mMaxAttnLogit[None, head_idx, batch_idx, split_idx]
+                    else:
+                        mMAL_cur = mMaxAttnLogit[None, head_idx, batch_idx]
+                else:
+                    offset = (
+                        seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    )
+                    if const_expr(self.is_split_kv):
+                        mMAL_cur = cute.domain_offset((offset,), mMaxAttnLogit[None, head_idx, split_idx])
+                    else:
+                        mMAL_cur = cute.domain_offset((offset,), mMaxAttnLogit[None, head_idx])
+
+            # Write LSE and max_attn_logit to gmem in a single loop.
+            # max_attn_logit = row_max / sqrt(head_dim), using the same row_max
+            # from stats[] as LSE, avoiding a second stats unpack.
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     if const_expr(self.is_split_kv):
@@ -2412,11 +2469,11 @@ class FlashAttentionForwardSm100:
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                     gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
+                    # row_max_logit = row_max * softmax_scale = row_max / sqrt(d)
+                    row_max_logit = row_max * softmax_scale_log2 * LN2
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                        row_max_logit + cute.math.log2(row_sum, fastmath=True) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
@@ -2426,8 +2483,10 @@ class FlashAttentionForwardSm100:
                         else seqlen.seqlen_q * self.qhead_per_kvhead
                     )
                     if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                        # This actually just works with PackGQA too
                         gLSE[tidx] = lse
+                        if const_expr(mMaxAttnLogit is not None):
+                            gMAL = cute.local_tile(mMAL_cur, (self.m_block_size,), (m_tile_idx,))
+                            gMAL[tidx] = row_max_logit
 
             # Advance to next tile
             tile_scheduler.advance_to_next_work()

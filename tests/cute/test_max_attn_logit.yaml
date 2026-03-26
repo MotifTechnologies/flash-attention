@@ -1,0 +1,68 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: jeesoo-fa4-max-logit-bench
+  namespace: kbm-g-np-motif
+spec:
+  managedBy: trainer.kubeflow.org/trainjob-controller
+  podTemplateOverrides:
+    - spec:
+        nodeSelector:
+          deepep: "false"
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: shm
+              - mountPath: /mair
+                name: mair
+        volumes:
+          - emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+            name: shm
+          - name: mair
+            persistentVolumeClaim:
+              claimName: mair
+      targetJobs:
+        - name: node
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed
+  suspend: false
+  trainer:
+    args:
+      - /bin/bash
+      - '-c'
+      - >
+        set -e
+
+        cd /mair/team-sys/jeesoo/flash-attention
+
+        pip install -e . 2>&1 | tail -5
+
+        pip install einops pytest 2>&1 | tail -3
+
+        echo "=== Running max_attn_logit benchmark ==="
+
+        python tests/cute/bench_max_attn_logit.py 2>&1 | tee /mair/team-sys/jeesoo/flash-attention/bench_max_logit_output.log
+
+        echo "=== Benchmark finished ==="
+    env:
+      - name: PYTHONUNBUFFERED
+        value: '1'
+      - name: CUDA_VISIBLE_DEVICES
+        value: '0'
+    image: ghcr.io/motiftechnologies/llm-training:hybrid_ep
+    numNodes: 1
+    numProcPerNode: 1
+    resourcesPerNode:
+      limits:
+        cpu: '16'
+        memory: 64Gi
+        nvidia.com/gpu: '1'
+      requests:
+        cpu: '16'
+        memory: 64Gi
+        nvidia.com/gpu: '1'
